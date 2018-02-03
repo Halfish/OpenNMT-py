@@ -11,6 +11,7 @@ def test_rouge(cand_file, ref_file):
     f_ref = open(ref_file, encoding="utf-8")
     current_time = time.strftime('%Y-%m-%d-%H-%M-%S', time.localtime())
     tmp_dir = ".rouge-tmp-{}".format(current_time)
+    print('saving in ' + tmp_dir)
     try:
         if not os.path.isdir(tmp_dir):
             os.mkdir(tmp_dir)
@@ -21,14 +22,18 @@ def test_rouge(cand_file, ref_file):
         assert len(candidates) == len(references)
         cnt = len(candidates)
         for i in range(cnt):
+            vocab = set(candidates[i].split(' ') + references[i].split(' '))
+            vocab = dict([(w, str(i)) for (i, w) in enumerate(vocab)])
             if len(references[i]) < 1:
                 continue
             with open(tmp_dir + "/candidate/cand.{}.txt".format(i), "w",
                       encoding="utf-8") as f:
-                f.write(candidates[i])
+                cand_i = ' '.join([vocab[c] for c in candidates[i].split(' ')])
+                f.write(cand_i)
             with open(tmp_dir + "/reference/ref.{}.txt".format(i), "w",
                       encoding="utf-8") as f:
-                f.write(references[i])
+                ref_i = ' '.join([vocab[r] for r in references[i].split(' ')])
+                f.write(ref_i)
         f_cand.close()
         f_ref.close()
         r = pyrouge.Rouge155()
@@ -37,6 +42,7 @@ def test_rouge(cand_file, ref_file):
         r.model_filename_pattern = 'ref.#ID#.txt'
         r.system_filename_pattern = 'cand.(\d+).txt'
         rouge_results = r.convert_and_evaluate()
+        print(rouge_results)
         results_dict = r.output_to_dict(rouge_results)
         return results_dict
     finally:
