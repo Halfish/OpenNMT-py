@@ -181,9 +181,23 @@ class NMTLossCompute(LossComputeBase):
         return {
             "output": output,
             "target": batch.tgt[range_[0] + 1: range_[1]],
+            "attns": attns['std'],
         }
 
-    def _compute_loss(self, batch, output, target):
+    def keyphrase_coverage_loss(self, output, target, average=True):
+        ''' output and target should all be both (batch_size, seq_len)
+            Also notice that tmp may contains zeros, which means 
+                there is no keyphrase, so the key_loss should be zero
+        '''
+        tmp = torch.sum(output * target, dim=1) 
+        loss = 1.0 / (tmp + 1e-8)
+        loss = tmp.gt(0).float() * loss # mask output invalid loss
+        if average:
+            return loss.sum()
+        else:
+            return loss
+
+    def _compute_loss(self, batch, output, target, attns):
         scores = self.generator(self._bottle(output))
 
         gtruth = target.view(-1)
@@ -198,7 +212,19 @@ class NMTLossCompute(LossComputeBase):
                 tmp_.index_fill_(0, mask, 0)
             gtruth = Variable(tmp_, requires_grad=False)
 
-        loss = self.criterion(scores, gtruth)
+        pred_loss = self.criterion(scores, gtruth)
+
+        # keyphrase coverage loss
+        key_target = batch.src_feat_0 - 2
+        key_target = key_target * key_target.ge(0).long() # mask out negative
+        key_target = key_target.float().transpose(0, 1)
+        key_output = attns.sum(0)
+
+        key_loss = self.keyphrase_coverage_loss(key_output, key_target)
+        loss = pred_loss + 10 * key_loss
+
+        print(pred_loss.data[0], key_loss.data[0], loss.data[0])
+
         if self.confidence < 1:
             loss_data = - likelihood.sum(0)
         else:
