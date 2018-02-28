@@ -58,7 +58,9 @@ class ONMTDatasetBase(torchtext.data.Dataset):
         if not tokens:
             return [], [], -1
 
-        split_tokens = [token.split(u"￨") for token in tokens]
+        #split_tokens = [token.split(u"￨") for token in tokens]
+        # modified by Bruce, what a strange symbol, "|"
+        split_tokens = [token.split(u"|") for token in tokens]
         split_tokens = [token for token in split_tokens if token[0]]
         token_size = len(split_tokens[0])
 
