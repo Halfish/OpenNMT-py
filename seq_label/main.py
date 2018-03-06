@@ -15,21 +15,20 @@ random.seed(1)
 PAD_SYMBOL = '<pad>'
 UNK_SYMBOL = '<unk>'
 
-'''
 # start and stop tag, only useful for CRF model
 START_TAG = '<start>'
 STOP_TAG = '<stop>'
 tag_to_ix = {'0':0, '1':1, START_TAG:2, STOP_TAG:3}
-'''
+#tag_to_ix = {'0':0, '1':1, START_TAG:3, STOP_TAG:4}
 
 import argparse
 parser = argparse.ArgumentParser()
-parser.add_argument("--batch_size", type=int, default=64)
+parser.add_argument("--batch_size", type=int, default=256)
 parser.add_argument("--hidden_dim", type=int, default=128)
 parser.add_argument("--num_layers", type=int, default=3)
 parser.add_argument("--bidirectional", type=bool, default=True)
 parser.add_argument("--embedding_dim", type=int, default=300)
-parser.add_argument("--tag_dim", type=int, default=2)
+parser.add_argument("--tag_dim", type=int, default=4)
 parser.add_argument("--learning_rate", type=float, default=1e-3)
 parser.add_argument("--total_epoches", type=int, default=10)
 parser.add_argument("--max_clip_norm", type=int, default=5)
@@ -41,6 +40,14 @@ parser.add_argument("--chpt_name", type=str, default="checkpoint.pt")
 parser.add_argument("--start_tag", type=str, default="<start>")
 parser.add_argument("--stop_tag", type=str, default="<stop>")
 args = parser.parse_args()
+
+
+def log_sum_exp(vec):
+    max_score, _ = torch.max(vec, dim=1)
+    max_score_broadcast = max_score.view(
+            args.batch_size, -1).expand(args.batch_size, vec.size()[1])
+    return max_score + \
+        torch.log(torch.sum(torch.exp(vec - max_score_broadcast), dim=1))
 
 
 class Vocab(object):
@@ -169,14 +176,12 @@ class SeqLabelModel(nn.Module):
         self.hidden2tag = nn.Linear(
                     args.hidden_dim * self.num_directions, args.tag_dim)
 
-        '''
         # transition matrix for CRF, Entry i,j is the score of 
         # transitioning to i from j
         self.transitions = nn.Parameter(torch.randn(args.tag_dim, args.tag_dim))
         # constraint we never transfer to the start tag or from the stop tag
         self.transitions.data[tag_to_ix[START_TAG], :] = -10000
         self.transitions.data[:, tag_to_ix[STOP_TAG]] = -10000
-        '''
 
     def _init_hidden(self):
         h_0 = Variable(torch.randn(args.num_layers * self.num_directions, 
@@ -198,15 +203,16 @@ class SeqLabelModel(nn.Module):
         lstm_feats = self.hidden2tag(lstm_out) 
         return lstm_feats
 
-'''
     def _forward_alg(self, feats):
         # Do the forward algorithm to compute the partition function
-        init_alphas = torch.Tensor(self.batch_size, args.tag_dim).fill_(-10000.)
+        init_alphas = torch.Tensor(args.batch_size, args.tag_dim).fill_(-10000.)
         # START_TAG has all of the score.
         init_alphas[:, tag_to_ix[START_TAG]] = 0.
 
         # Wrap in a variable so that we will get automatic backprop
-        forward_var = autograd.Variable(init_alphas)
+        forward_var = Variable(init_alphas)
+        if args.use_gpu:
+            forward_var = forward_var.cuda()
 
         # Iterate through the sentence
         for feat in feats:
@@ -224,16 +230,21 @@ class SeqLabelModel(nn.Module):
                 # The forward variable for this tag is log-sum-exp of all the
                 # scores.
                 alphas_t.append(log_sum_exp(next_tag_var))
-            forward_var = torch.cat(alphas_t).view(self.batch_size, -1)
+            forward_var = torch.cat(alphas_t).view(args.tag_dim, args.batch_size)
+            forward_var = forward_var.transpose(0, 1).contiguous()
         terminal_var = forward_var + self.transitions[tag_to_ix[STOP_TAG]]
         alpha = log_sum_exp(terminal_var)
         return alpha
 
     def _score_sentence(self, feats, tags):
         # Gives the score of a provided tag sequence
-        score = autograd.Variable(torch.zeros(args.batch_size))
+        score = Variable(torch.zeros(args.batch_size))
         start_ids = torch.LongTensor([tag_to_ix[START_TAG]] * args.batch_size)
-        tags = torch.cat([start_ids.view(args.batch_size, -1), tags], dim=1)
+        start_ids = Variable(start_ids.view(args.batch_size, -1))
+        if args.use_gpu:
+            score = score.cuda()
+            start_ids = start_ids.cuda()
+        tags = torch.cat([start_ids, tags], dim=1)
         for i, feat in enumerate(feats):
             trans_score = torch.cat([self.transitions[y, x] for x, y in tags[:, i:i+2]])
             feat_score = torch.cat(
@@ -250,7 +261,9 @@ class SeqLabelModel(nn.Module):
         init_vvars[:, tag_to_ix[START_TAG]] = 0
 
         # forward_var at step i holds the viterbi variables for step i-1
-        forward_var = autograd.Variable(init_vvars)
+        forward_var = Variable(init_vvars)
+        if args.use_gpu:
+            forward_var = forward_var.cuda()
         for feat in feats:
             bptrs_t = []  # holds the backpointers for this step
             viterbivars_t = []  # holds the viterbi variables for this step
@@ -267,8 +280,10 @@ class SeqLabelModel(nn.Module):
                 viterbivars_t.append(best_var)
             # Now add in the emission scores, and assign forward_var to the set
             # of viterbi variables we just computed
-            forward_var = torch.cat(viterbivars_t).view(args.batch_size, -1) + feat
-            backpointers.append(torch.cat(bptrs_t).view(args.batch_size, -1))
+            forward_var = torch.cat(viterbivars_t).view(
+                    -1, args.batch_size).transpose(0, 1) + feat
+            backpointers.append(
+                    torch.cat(bptrs_t).view(-1, args.batch_size).transpose(0, 1))
 
         # Transition to STOP_TAG
         terminal_var = forward_var + self.transitions[tag_to_ix[STOP_TAG]]
@@ -289,11 +304,18 @@ class SeqLabelModel(nn.Module):
 
     def neg_log_likelihood(self, sentence, tags):
         feats = self._get_lstm_features(sentence)
+        '''
+        feats = torch.load('feats.pt').cuda().expand(
+                args.batch_size, 11, 5).transpose(0, 1)
+        self.transitions.data = torch.load('trans.pt').cuda().data
+        tags = Variable(torch.load('tags.pt').cuda().expand(
+                args.batch_size, 11))
+        '''
         forward_score = self._forward_alg(feats)
         gold_score = self._score_sentence(feats, tags)
-        loss = (forward_score - gold_score).sum()
-        score, tag_seq = self._viterbi_decode(feats)
-        return loss, score, tag_seq
+        loss = (forward_score - gold_score).mean()
+        _, tag_pred = self._viterbi_decode(feats)
+        return loss, tag_pred
 
     def forward(self, sentence):  # dont confuse this with _forward_alg above.
         # Get the emission scores from the BiLSTM
@@ -302,7 +324,6 @@ class SeqLabelModel(nn.Module):
         # Find the best path, given the features.
         score, tag_seq = self._viterbi_decode(lstm_feats)
         return score, tag_seq
-'''
 
 
 class Trainer(object):
@@ -313,11 +334,9 @@ class Trainer(object):
         self.learning_rate = args.learning_rate
         self.train_dataset = train_dataset
         self.valid_dataset = valid_dataset
-        self.loss_fn = nn.CrossEntropyLoss(weight=torch.FloatTensor([1, 8]))
         self.optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
         if args.use_gpu:
-            self.loss_fn = self.loss_fn.cuda()
             self.model = self.model.cuda()
 
     @staticmethod
@@ -329,21 +348,13 @@ class Trainer(object):
         false_accu = (~(outputs | targets)).float().sum() / (~targets).float().sum()
         return true_accu, false_accu
 
-    def forward(self, sentences, tags):
-        scores = self.model._get_lstm_features(sentences)
-        scores = scores.transpose(0, 1).contiguous().view(-1, scores.size(2))
-        tags = tags.view(-1)
-        loss = self.loss_fn(scores, tags)
-        _, indices = torch.max(scores, -1)
-        true_accu, false_accu = Trainer.binary_accuracy(indices, tags)
-        return loss, true_accu, false_accu
-
     def train(self):
         '''random choose batch data and training it on the model
         '''
         self.model.train()
         sentences, tags, lengths = self.train_dataset.next_batch()
-        loss, true_accu, false_accu = self.forward(sentences, tags)
+        loss, tag_pred = self.model.neg_log_likelihood(sentences, tags)
+        true_accu, false_accu = Trainer.binary_accuracy(tag_pred, tags)
         self.optimizer.zero_grad()
         loss.backward() 
         total_norm = torch.nn.utils.clip_grad_norm(
@@ -359,7 +370,8 @@ class Trainer(object):
         valid_loss = []
         for batchid in range(len(self.valid_dataset) // args.batch_size):
             sentences, tags, lengths = self.valid_dataset.next_batch()
-            loss, true_accu, false_accu = self.forward(sentences, tags)
+            loss, tag_pred = self.model.neg_log_likelihood(sentences, tags)
+            true_accu, false_accu = Trainer.binary_accuracy(tag_pred, tags)
             print(('\tepoch %d, batchid=%d, valid_loss=%.5f,' 
                     ' true_accu=%.5f, false_accu=%.5f') 
                     % (epoch, batchid, loss.data[0], true_accu, false_accu))
