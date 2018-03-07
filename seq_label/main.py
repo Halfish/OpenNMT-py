@@ -23,7 +23,7 @@ tag_to_ix = {'0':0, '1':1, START_TAG:2, STOP_TAG:3}
 
 import argparse
 parser = argparse.ArgumentParser()
-parser.add_argument("--batch_size", type=int, default=256)
+parser.add_argument("--batch_size", type=int, default=128)
 parser.add_argument("--hidden_dim", type=int, default=128)
 parser.add_argument("--num_layers", type=int, default=3)
 parser.add_argument("--bidirectional", type=bool, default=True)
@@ -163,9 +163,13 @@ class SeqLabelModel(nn.Module):
     '''
     sequence labelling model with LSTM-CRF
     '''
-    def __init__(self, vocab):
+    def __init__(self, vocab, weight=[1, 10, 1, 1]):
         super(SeqLabelModel, self).__init__()
         self.vocab = vocab
+        self.weight = Variable(torch.FloatTensor(weight))
+        assert len(weight) == args.tag_dim
+        if args.use_gpu:
+            self.weight = self.weight.cuda()
         self.num_directions = 2 if args.bidirectional else 1
         self.embedding = nn.Embedding(
                 len(vocab), args.embedding_dim, padding_idx=vocab[PAD_SYMBOL])
@@ -237,19 +241,24 @@ class SeqLabelModel(nn.Module):
         return alpha
 
     def _score_sentence(self, feats, tags):
+        '''
+        Args:
+            feats: FloatTensor  (seq_len, batch_size, tag_dim)
+            tags: LongTensor    (batch_size, seq_len)
+        '''
+        tag_weight = self.weight[tags.view(-1)].view_as(tags)
+
         # Gives the score of a provided tag sequence
-        score = Variable(torch.zeros(args.batch_size))
         start_ids = torch.LongTensor([tag_to_ix[START_TAG]] * args.batch_size)
         start_ids = Variable(start_ids.view(args.batch_size, -1))
         if args.use_gpu:
-            score = score.cuda()
             start_ids = start_ids.cuda()
         tags = torch.cat([start_ids, tags], dim=1)
-        for i, feat in enumerate(feats):
-            trans_score = torch.cat([self.transitions[y, x] for x, y in tags[:, i:i+2]])
-            feat_score = torch.cat(
-                    [feat[i, index] for i, index in enumerate(tags[:, i+1])])
-            score = score + trans_score + feat_score
+
+        trans_score = self.transitions[tags[:, 1:], tags[:, :-1]] # (batch_size, seq_len)
+        feat_score = torch.gather(feats, 2, tags[:, 1:].transpose(0, 1).unsqueeze(-1)
+                        ).squeeze(-1).transpose(0, 1) # (batch_size, seq_len)
+        score = torch.sum((trans_score + feat_score), dim=1)
         score = score + self.transitions[tag_to_ix[STOP_TAG], tags[:, -1]]
         return score
 
@@ -280,10 +289,8 @@ class SeqLabelModel(nn.Module):
                 viterbivars_t.append(best_var)
             # Now add in the emission scores, and assign forward_var to the set
             # of viterbi variables we just computed
-            forward_var = torch.cat(viterbivars_t).view(
-                    -1, args.batch_size).transpose(0, 1) + feat
-            backpointers.append(
-                    torch.cat(bptrs_t).view(-1, args.batch_size).transpose(0, 1))
+            forward_var = torch.stack(viterbivars_t, 1) + feat
+            backpointers.append(torch.stack(bptrs_t, 1))
 
         # Transition to STOP_TAG
         terminal_var = forward_var + self.transitions[tag_to_ix[STOP_TAG]]
@@ -304,13 +311,6 @@ class SeqLabelModel(nn.Module):
 
     def neg_log_likelihood(self, sentence, tags):
         feats = self._get_lstm_features(sentence)
-        '''
-        feats = torch.load('feats.pt').cuda().expand(
-                args.batch_size, 11, 5).transpose(0, 1)
-        self.transitions.data = torch.load('trans.pt').cuda().data
-        tags = Variable(torch.load('tags.pt').cuda().expand(
-                args.batch_size, 11))
-        '''
         forward_score = self._forward_alg(feats)
         gold_score = self._score_sentence(feats, tags)
         loss = (forward_score - gold_score).mean()
