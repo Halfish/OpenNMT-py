@@ -16,18 +16,21 @@ elif [ "$1" == "train" ]; then
 	python train.py \
 		-data data/weibo \
 		-save_model baseline \
+		-share_embeddings \
+		-normalization tokens \
 		-optim adam \
 		-learning_rate 0.001 \
-		-gpuid 0 \
 		-exp_host 172.18.217.118 \
-		-exp key
+		-epoch 1000 \
+		-start_decay_at 10 \
+		-exp key \
+		-gpuid 0
 elif [ "$1" == "predict" ]; then
 	python translate.py \
-		-model keyphrase.pt \
-		-src ./weibo/src-test.keywords.txt \
-		-tgt ./weibo/tgt-test.keywords.txt \
+		-model keywords.pt \
+		-src ./weibo/src-test.txt \
+		-tgt ./weibo/tgt-test.txt \
 		-output pred.txt \
-		-gpu 0 \
 		-replace_unk \
 		-report_bleu \
 		-report_rouge \

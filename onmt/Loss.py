@@ -7,6 +7,7 @@ This includes: LossComputeBase and the standard NMTLossCompute, and
 from __future__ import division
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.autograd import Variable
 
 import onmt
@@ -38,7 +39,7 @@ class LossComputeBase(nn.Module):
         self.tgt_vocab = tgt_vocab
         self.padding_idx = tgt_vocab.stoi[onmt.io.PAD_WORD]
 
-    def _make_shard_state(self, batch, output, range_, attns=None):
+    def _make_shard_state(self, batch, tag_score, output, range_, attns=None):
         """
         Make shard state dictionary for shards() to return iterable
         shards for efficient loss computation. Subclass must define
@@ -52,7 +53,7 @@ class LossComputeBase(nn.Module):
         """
         return NotImplementedError
 
-    def _compute_loss(self, batch, output, target, **kwargs):
+    def _compute_loss(self, batch, tag_score, output, target, **kwargs):
         """
         Compute the loss. Subclass must define this method.
 
@@ -65,7 +66,7 @@ class LossComputeBase(nn.Module):
         """
         return NotImplementedError
 
-    def monolithic_compute_loss(self, batch, output, attns):
+    def monolithic_compute_loss(self, batch, tag_score, output, attns):
         """
         Compute the forward loss for the batch.
 
@@ -80,12 +81,12 @@ class LossComputeBase(nn.Module):
             :obj:`onmt.Statistics`: loss statistics
         """
         range_ = (0, batch.tgt.size(0))
-        shard_state = self._make_shard_state(batch, output, range_, attns)
+        shard_state = self._make_shard_state(batch, tag_score, output, range_, attns)
         _, batch_stats = self._compute_loss(batch, **shard_state)
 
         return batch_stats
 
-    def sharded_compute_loss(self, batch, output, attns,
+    def sharded_compute_loss(self, batch, tag_score, output, attns,
                              cur_trunc, trunc_size, shard_size,
                              normalization):
         """Compute the forward loss and backpropagate.  Computation is done
@@ -102,6 +103,8 @@ class LossComputeBase(nn.Module):
 
         Args:
           batch (batch) : batch of labeled examples
+          tag_score(FloatTensor) :
+                output of tag score : [src_len x batch_size x tag_dim]
           output (:obj:`FloatTensor`) :
               output of decoder model `[tgt_len x batch x hidden]`
           attns (dict) : dictionary of attention distributions
@@ -116,7 +119,7 @@ class LossComputeBase(nn.Module):
         """
         batch_stats = onmt.Statistics()
         range_ = (cur_trunc, cur_trunc + trunc_size)
-        shard_state = self._make_shard_state(batch, output, range_, attns)
+        shard_state = self._make_shard_state(batch, tag_score, output, range_, attns)
 
         for shard in shards(shard_state, shard_size):
             loss, stats = self._compute_loss(batch, **shard)
@@ -126,7 +129,7 @@ class LossComputeBase(nn.Module):
 
         return batch_stats
 
-    def _stats(self, loss, scores, target):
+    def _stats(self, loss, key_loss, gamma, scores, target):
         """
         Args:
             loss (:obj:`FloatTensor`): the loss computed by the loss criterion.
@@ -141,7 +144,7 @@ class LossComputeBase(nn.Module):
         num_correct = pred.eq(target) \
                           .masked_select(non_padding) \
                           .sum()
-        return onmt.Statistics(loss[0], non_padding.sum(), num_correct)
+        return onmt.Statistics(loss[0], key_loss, gamma, non_padding.sum(), num_correct)
 
     def _bottle(self, v):
         return v.view(-1, v.size(2))
@@ -175,29 +178,39 @@ class NMTLossCompute(LossComputeBase):
             weight = torch.ones(len(tgt_vocab))
             weight[self.padding_idx] = 0
             self.criterion = nn.NLLLoss(weight, size_average=False)
+            self.tag_criterion = nn.CrossEntropyLoss(
+                        weight=torch.FloatTensor([1, 8]), reduce=False)
         self.confidence = 1.0 - label_smoothing
+        self.count = 0
 
-    def _make_shard_state(self, batch, output, range_, attns=None):
+    def _make_shard_state(self, batch, tag_score, output, range_, attns=None):
         return {
+            "tag_score": tag_score,
             "output": output,
             "target": batch.tgt[range_[0] + 1: range_[1]],
             "attns": attns['std'],
         }
 
-    def keyphrase_coverage_loss(self, output, target, average=True):
+    def keyphrase_coverage_loss(self, output, target, size_average=False):
         ''' output and target should all be both (batch_size, seq_len)
             Also notice that tmp may contains zeros, which means 
                 there is no keyphrase, so the key_loss should be zero
         '''
-        tmp = torch.sum(output * target, dim=1) 
-        loss = 1.0 / (tmp + 1e-8)
-        loss = tmp.gt(0).float() * loss # mask output invalid loss
-        if average:
-            return loss.sum()
+        #tmp = torch.sum(output * target, dim=1) 
+        #loss = 1.0 / (tmp + 1e-8)
+        #loss = tmp.gt(0).float() * loss # mask output invalid loss
+        loss = target * (1 / (torch.min(output, torch.ones_like(output)) + 1e-9) - 1)
+        if size_average:
+            return loss.mean()
         else:
-            return loss
+            return loss.sum()
 
-    def _compute_loss(self, batch, output, target, attns):
+    def _compute_loss(self, batch, tag_score, output, target, attns):
+        '''
+            tag_score (src_len, batch_size, tag_dim)
+            output (tgt_len, batch_size, hidden_dim)
+            attns (tgt_len, batch_size, src_len)
+        '''
         scores = self.generator(self._bottle(output))
 
         gtruth = target.view(-1)
@@ -214,23 +227,43 @@ class NMTLossCompute(LossComputeBase):
 
         pred_loss = self.criterion(scores, gtruth)
 
+        # keyphrase predict loss
+        tag_weight = onmt.Utils.sequence_mask(batch.src[1]) # (batch_size, src_len)
+        tag_weight = Variable(tag_weight).float().transpose(0, 1).contiguous()
+        '''
+        tag_target = batch.src_feat_0 - 2
+        tag_loss = self.tag_criterion(tag_score.view(-1, 2), tag_target.view(-1))
+        tag_loss = torch.mean(tag_weight * tag_loss.view_as(tag_weight))
+        '''
+
+        # soft keyphrase coverage loss
+        '''
+        tag_pred = F.softmax(tag_score, -1)[:, :, 1] # (src_len, batch_size)
+        tag_attn = attns.sum(0).transpose(0, 1) # (src_len, batch_size)
+        tag_cover_loss = tag_weight * torch.max(
+                        tag_pred - tag_attn, torch.zeros_like(tag_attn))
+        tag_cover_loss = tag_cover_loss.sum()
+	'''
         # keyphrase coverage loss
-        key_target = batch.src_feat_0 - 2
-        key_target = key_target * key_target.ge(0).long() # mask out negative
-        key_target = key_target.float().transpose(0, 1)
         key_output = attns.sum(0)
+        key_target = (tag_weight * (batch.src_feat_0 - 2).float()).transpose(0, 1)
+        key_cover_loss = self.keyphrase_coverage_loss(key_output, key_target)
 
-        key_loss = self.keyphrase_coverage_loss(key_output, key_target)
-        loss = pred_loss + 10 * key_loss
-
-        print(pred_loss.data[0], key_loss.data[0], loss.data[0])
+        # total loss
+        if self.count < 300000:
+            gamma = 0
+        else:
+            gamma = min(self.count / 100000 - 3, 1)
+        self.count += 1
+        loss = pred_loss + gamma * key_cover_loss
 
         if self.confidence < 1:
             loss_data = - likelihood.sum(0)
         else:
             loss_data = loss.data.clone()
 
-        stats = self._stats(loss_data, scores.data, target.view(-1).data)
+        stats = self._stats(loss_data, 
+                key_cover_loss.data[0], gamma, scores.data, target.view(-1).data)
 
         return loss, stats
 

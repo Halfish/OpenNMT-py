@@ -526,6 +526,7 @@ class NMTModel(nn.Module):
         super(NMTModel, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
+        self.hidden2tag = nn.Linear(encoder.rnn.hidden_size, 2)
 
     def forward(self, src, tgt, lengths, dec_state=None):
         """Forward propagate a `src` and `tgt` pair for training.
@@ -549,7 +550,9 @@ class NMTModel(nn.Module):
                  * final decoder state
         """
         tgt = tgt[:-1]  # exclude last target from inputs
+        src = src[:, :, :1] # exclude the keyphrase label
         enc_hidden, context = self.encoder(src, lengths)
+        tag_score = self.hidden2tag(context)
         enc_state = self.decoder.init_decoder_state(src, context, enc_hidden)
         out, dec_state, attns = self.decoder(tgt, context,
                                              enc_state if dec_state is None
@@ -559,7 +562,7 @@ class NMTModel(nn.Module):
             # Not yet supported on multi-gpu
             dec_state = None
             attns = None
-        return out, attns, dec_state
+        return tag_score, out, attns, dec_state
 
 
 class DecoderState(object):

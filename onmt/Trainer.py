@@ -29,8 +29,10 @@ class Statistics(object):
     * perplexity
     * elapsed time
     """
-    def __init__(self, loss=0, n_words=0, n_correct=0):
+    def __init__(self, loss=0, key_loss=0, gamma=0, n_words=0, n_correct=0):
         self.loss = loss
+        self.key_loss = key_loss
+        self.gamma = gamma
         self.n_words = n_words
         self.n_correct = n_correct
         self.n_src_words = 0
@@ -40,6 +42,8 @@ class Statistics(object):
         self.loss += stat.loss
         self.n_words += stat.n_words
         self.n_correct += stat.n_correct
+        self.key_loss = stat.key_loss
+        self.gamma = stat.gamma
 
     def accuracy(self):
         return 100 * (self.n_correct / self.n_words)
@@ -76,6 +80,8 @@ class Statistics(object):
         experiment.add_scalar_value(prefix + "_accuracy", self.accuracy())
         experiment.add_scalar_value(prefix + "_tgtper",  self.n_words / t)
         experiment.add_scalar_value(prefix + "_lr", lr)
+        experiment.add_scalar_value(prefix + "_keyloss", self.key_loss)
+        experiment.add_scalar_value(prefix + "_gamma", self.gamma)
 
 
 class Trainer(object):
@@ -206,11 +212,11 @@ class Trainer(object):
             tgt = onmt.io.make_features(batch, 'tgt')
 
             # F-prop through the model.
-            outputs, attns, _ = self.model(src, tgt, src_lengths)
+            tag_score, outputs, attns, _ = self.model(src, tgt, src_lengths)
 
             # Compute loss.
             batch_stats = self.valid_loss.monolithic_compute_loss(
-                    batch, outputs, attns)
+                    batch, tag_score, outputs, attns)
 
             # Update statistics.
             stats.update(batch_stats)
@@ -286,12 +292,12 @@ class Trainer(object):
                 # 2. F-prop all but generator.
                 if self.grad_accum_count == 1:
                     self.model.zero_grad()
-                outputs, attns, dec_state = \
+                tag_score, outputs, attns, dec_state = \
                     self.model(src, tgt, src_lengths, dec_state)
 
                 # 3. Compute loss in shards for memory efficiency.
                 batch_stats = self.train_loss.sharded_compute_loss(
-                        batch, outputs, attns, j,
+                        batch, tag_score, outputs, attns, j,
                         trunc_size, self.shard_size, normalization)
 
                 # 4. Update the parameters and statistics.

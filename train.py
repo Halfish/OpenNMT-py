@@ -66,8 +66,8 @@ if opt.exp_host != "":
 
     experiments = cc.get_experiment_names()
     print(experiments)
-    if opt.exp in experiments:
-        cc.remove_experiment(opt.exp)
+    #if opt.exp in experiments:
+    cc.remove_experiment(opt.exp)
     experiment = cc.create_experiment(opt.exp)
 
 

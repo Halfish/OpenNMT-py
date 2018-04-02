@@ -10,9 +10,9 @@ def model_opts(parser):
 
     # Embedding Options
     group = parser.add_argument_group('Model-Embeddings')
-    group.add_argument('-src_word_vec_size', type=int, default=500,
+    group.add_argument('-src_word_vec_size', type=int, default=300,
                        help='Word embedding size for src.')
-    group.add_argument('-tgt_word_vec_size', type=int, default=500,
+    group.add_argument('-tgt_word_vec_size', type=int, default=300,
                        help='Word embedding size for tgt.')
     group.add_argument('-word_vec_size', type=int, default=-1,
                        help='Word embedding size for src and tgt.')
@@ -67,7 +67,7 @@ def model_opts(parser):
                        help='Number of layers in the encoder')
     group.add_argument('-dec_layers', type=int, default=2,
                        help='Number of layers in the decoder')
-    group.add_argument('-rnn_size', type=int, default=500,
+    group.add_argument('-rnn_size', type=int, default=300,
                        help='Size of rnn hidden states')
     group.add_argument('-cnn_kernel_width', type=int, default=3,
                        help="""Size of windows in the cnn, the kernel_size is
@@ -267,9 +267,9 @@ def train_opts(parser):
                        Approximately equivalent to updating
                        batch_size * accum_count batches at once.
                        Recommended for Transformer.""")
-    group.add_argument('-valid_batch_size', type=int, default=32,
+    group.add_argument('-valid_batch_size', type=int, default=64,
                        help='Maximum batch size for validation')
-    group.add_argument('-max_generator_batches', type=int, default=32,
+    group.add_argument('-max_generator_batches', type=int, default=1000,
                        help="""Maximum batches of words in a sequence to run
                         the generator on in parallel. Higher is faster, but
                         uses more memory.""")
@@ -424,7 +424,7 @@ def translate_opts(parser):
                        decoded sentences""")
 
     group = parser.add_argument_group('Efficiency')
-    group.add_argument('-batch_size', type=int, default=30,
+    group.add_argument('-batch_size', type=int, default=64,
                        help='Batch size')
     group.add_argument('-gpu', type=int, default=-1,
                        help="Device to run on")
