@@ -23,17 +23,19 @@ tag_to_ix = {'0':0, '1':1, START_TAG:2, STOP_TAG:3}
 
 import argparse
 parser = argparse.ArgumentParser()
-parser.add_argument("--batch_size", type=int, default=128)
+parser.add_argument("--batch_size", type=int, default=256)
+parser.add_argument("--use_crf", type=bool, default=False)
 parser.add_argument("--hidden_dim", type=int, default=128)
 parser.add_argument("--num_layers", type=int, default=3)
 parser.add_argument("--bidirectional", type=bool, default=True)
 parser.add_argument("--embedding_dim", type=int, default=300)
-parser.add_argument("--tag_dim", type=int, default=4)
+parser.add_argument("--tag_dim", type=int, default=2)
 parser.add_argument("--learning_rate", type=float, default=1e-3)
+parser.add_argument("--lr_decay_freq", type=int, default=5000)
+parser.add_argument("--lr_start_decay", type=int, default=5)
 parser.add_argument("--total_epoches", type=int, default=10)
 parser.add_argument("--max_clip_norm", type=int, default=5)
 parser.add_argument("--valid_freq", type=int, default=1000)
-parser.add_argument("--lr_decay_freq", type=int, default=2000)
 parser.add_argument("--use_gpu", type=bool, default=True)
 parser.add_argument("--load_checkpoint", type=bool, default=False)
 parser.add_argument("--chpt_name", type=str, default="checkpoint.pt")
@@ -163,13 +165,17 @@ class SeqLabelModel(nn.Module):
     '''
     sequence labelling model with LSTM-CRF
     '''
-    def __init__(self, vocab, weight=[1, 10, 1, 1]):
+    def __init__(self, vocab):
         super(SeqLabelModel, self).__init__()
         self.vocab = vocab
-        self.weight = Variable(torch.FloatTensor(weight))
-        assert len(weight) == args.tag_dim
+        '''
+        self.weight = Variable(torch.FloatTensor([1, 10, 1, 1]))
+        self.weight = self.weight / self.weight.mean()
+        assert len(weight) == self.tag_dim
         if args.use_gpu:
             self.weight = self.weight.cuda()
+        '''
+        self.tag_dim = args.tag_dim + 2 if args.use_crf else args.tag_dim
         self.num_directions = 2 if args.bidirectional else 1
         self.embedding = nn.Embedding(
                 len(vocab), args.embedding_dim, padding_idx=vocab[PAD_SYMBOL])
@@ -178,14 +184,17 @@ class SeqLabelModel(nn.Module):
                             bidirectional=args.bidirectional, 
                             batch_first=False)
         self.hidden2tag = nn.Linear(
-                    args.hidden_dim * self.num_directions, args.tag_dim)
+                    args.hidden_dim * self.num_directions, self.tag_dim)
 
-        # transition matrix for CRF, Entry i,j is the score of 
-        # transitioning to i from j
-        self.transitions = nn.Parameter(torch.randn(args.tag_dim, args.tag_dim))
-        # constraint we never transfer to the start tag or from the stop tag
-        self.transitions.data[tag_to_ix[START_TAG], :] = -10000
-        self.transitions.data[:, tag_to_ix[STOP_TAG]] = -10000
+        if args.use_crf:
+            # transition matrix for CRF, Entry i,j is the score of 
+            # transitioning to i from j
+            self.transitions = nn.Parameter(torch.randn(self.tag_dim, self.tag_dim))
+            # constraint we never transfer to the start tag or from the stop tag
+            self.transitions.data[tag_to_ix[START_TAG], :] = -10000
+            self.transitions.data[:, tag_to_ix[STOP_TAG]] = -10000
+        else:
+            self.loss_fn = nn.CrossEntropyLoss(weight=torch.FloatTensor([1, 8]))
 
     def _init_hidden(self):
         h_0 = Variable(torch.randn(args.num_layers * self.num_directions, 
@@ -197,7 +206,7 @@ class SeqLabelModel(nn.Module):
 
         return h_0, c_0
 
-    def _get_lstm_features(self, sentence):
+    def get_lstm_features(self, sentence):
         h, c = self._init_hidden()
         # embeds is (seq_len, batch_size, embedding_dim)
         embeds = self.embedding(sentence).transpose(0, 1) 
@@ -208,8 +217,9 @@ class SeqLabelModel(nn.Module):
         return lstm_feats
 
     def _forward_alg(self, feats):
-        # Do the forward algorithm to compute the partition function
-        init_alphas = torch.Tensor(args.batch_size, args.tag_dim).fill_(-10000.)
+        '''Do the forward algorithm to compute the partition function
+        '''
+        init_alphas = torch.Tensor(args.batch_size, self.tag_dim).fill_(-10000.)
         # START_TAG has all of the score.
         init_alphas[:, tag_to_ix[START_TAG]] = 0.
 
@@ -221,10 +231,10 @@ class SeqLabelModel(nn.Module):
         # Iterate through the sentence
         for feat in feats:
             alphas_t = []  # The forward variables at this timestep
-            for next_tag in range(args.tag_dim):
+            for next_tag in range(self.tag_dim):
                 # broadcast the emission score: it is the same regardless of
                 # the previous tag
-                emit_score = feat[:, next_tag].unsqueeze(1).expand(-1, args.tag_dim)
+                emit_score = feat[:, next_tag].unsqueeze(1).expand(-1, self.tag_dim)
                 # the ith entry of trans_score is the score of transitioning to
                 # next_tag from i
                 trans_score = self.transitions[next_tag]
@@ -234,7 +244,7 @@ class SeqLabelModel(nn.Module):
                 # The forward variable for this tag is log-sum-exp of all the
                 # scores.
                 alphas_t.append(log_sum_exp(next_tag_var))
-            forward_var = torch.cat(alphas_t).view(args.tag_dim, args.batch_size)
+            forward_var = torch.cat(alphas_t).view(self.tag_dim, args.batch_size)
             forward_var = forward_var.transpose(0, 1).contiguous()
         terminal_var = forward_var + self.transitions[tag_to_ix[STOP_TAG]]
         alpha = log_sum_exp(terminal_var)
@@ -246,7 +256,8 @@ class SeqLabelModel(nn.Module):
             feats: FloatTensor  (seq_len, batch_size, tag_dim)
             tags: LongTensor    (batch_size, seq_len)
         '''
-        tag_weight = self.weight[tags.view(-1)].view_as(tags)
+        #tag_weight = self.weight[tags.view(-1)].view_as(tags)
+        #stop_tag_weight = self.weight[tag_to_ix[STOP_TAG]].expand(args.batch_size)
 
         # Gives the score of a provided tag sequence
         start_ids = torch.LongTensor([tag_to_ix[START_TAG]] * args.batch_size)
@@ -258,7 +269,7 @@ class SeqLabelModel(nn.Module):
         trans_score = self.transitions[tags[:, 1:], tags[:, :-1]] # (batch_size, seq_len)
         feat_score = torch.gather(feats, 2, tags[:, 1:].transpose(0, 1).unsqueeze(-1)
                         ).squeeze(-1).transpose(0, 1) # (batch_size, seq_len)
-        score = torch.sum((trans_score + feat_score), dim=1)
+        score = torch.sum(trans_score + feat_score, dim=1)
         score = score + self.transitions[tag_to_ix[STOP_TAG], tags[:, -1]]
         return score
 
@@ -266,7 +277,7 @@ class SeqLabelModel(nn.Module):
         backpointers = []
 
         # Initialize the viterbi variables in log space
-        init_vvars = torch.Tensor(args.batch_size, args.tag_dim).fill_(-10000.)
+        init_vvars = torch.Tensor(args.batch_size, self.tag_dim).fill_(-10000.)
         init_vvars[:, tag_to_ix[START_TAG]] = 0
 
         # forward_var at step i holds the viterbi variables for step i-1
@@ -277,7 +288,7 @@ class SeqLabelModel(nn.Module):
             bptrs_t = []  # holds the backpointers for this step
             viterbivars_t = []  # holds the viterbi variables for this step
 
-            for next_tag in range(args.tag_dim):
+            for next_tag in range(self.tag_dim):
                 # next_tag_var[i] holds the viterbi variable for tag i at the
                 # previous step, plus the score of transitioning
                 # from tag i to next_tag.
@@ -309,21 +320,50 @@ class SeqLabelModel(nn.Module):
         best_path = torch.stack(best_path, 1)
         return path_score, best_path
 
+    @staticmethod
+    def binary_accuracy(outputs, targets):
+        outputs = outputs.data.contiguous().view(-1).byte()
+        targets = targets.data.contiguous().view(-1).byte()
+        assert (outputs.numel() == targets.numel()), 'size do not match'
+        true_accu = (outputs & targets).float().sum() / targets.float().sum()
+        false_accu = (~(outputs | targets)).float().sum() / (~targets).float().sum()
+        return true_accu, false_accu
+
     def neg_log_likelihood(self, sentence, tags):
-        feats = self._get_lstm_features(sentence)
+        '''training and validation for bi-lstm-crf model
+        '''
+        feats = self.get_lstm_features(sentence)
         forward_score = self._forward_alg(feats)
         gold_score = self._score_sentence(feats, tags)
         loss = (forward_score - gold_score).mean()
         _, tag_pred = self._viterbi_decode(feats)
-        return loss, tag_pred
+        true_accu, false_accu = SeqLabelModel.binary_accuracy(tag_pred, tags)
+        return loss, true_accu, false_accu
 
-    def forward(self, sentence):  # dont confuse this with _forward_alg above.
+    def lstm_forward(self, sentence, tags):
+        '''training and validation for lstm model
+        '''
+        feats = self.get_lstm_features(sentence) # (seq_len, batch_size, tag_dim)
+        scores = feats.transpose(0, 1).contiguous().view(-1, feats.size(2))
+        tags = tags.view(-1)
+        loss = self.loss_fn(scores, tags)
+        _, indices = torch.max(scores, -1)
+        true_accu, false_accu = SeqLabelModel.binary_accuracy(indices, tags)
+        return loss, true_accu, false_accu
+
+    def forward(self, sentence):
+        '''
+        prediction for lstm model or bi-lstm-crf model
+        '''
+        # dont confuse this with _forward_alg above.
         # Get the emission scores from the BiLSTM
-        lstm_feats = self._get_lstm_features(sentence)
-
-        # Find the best path, given the features.
-        score, tag_seq = self._viterbi_decode(lstm_feats)
-        return score, tag_seq
+        lstm_feats = self.get_lstm_features(sentence)
+        if not args.use_crf:
+            return lstm_feats
+        else:
+            # Find the best path, given the features.
+            score, tag_seq = self._viterbi_decode(lstm_feats)
+            return score, tag_seq
 
 
 class Trainer(object):
@@ -339,22 +379,15 @@ class Trainer(object):
         if args.use_gpu:
             self.model = self.model.cuda()
 
-    @staticmethod
-    def binary_accuracy(outputs, targets):
-        outputs = outputs.data.contiguous().view(-1).byte()
-        targets = targets.data.contiguous().view(-1).byte()
-        assert (outputs.numel() == targets.numel()), 'size do not match'
-        true_accu = (outputs & targets).float().sum() / targets.float().sum()
-        false_accu = (~(outputs | targets)).float().sum() / (~targets).float().sum()
-        return true_accu, false_accu
-
     def train(self):
         '''random choose batch data and training it on the model
         '''
         self.model.train()
         sentences, tags, lengths = self.train_dataset.next_batch()
-        loss, tag_pred = self.model.neg_log_likelihood(sentences, tags)
-        true_accu, false_accu = Trainer.binary_accuracy(tag_pred, tags)
+        if args.use_crf:
+            loss, true_accu, false_accu = self.model.neg_log_likelihood(sentences, tags)
+        else:
+            loss, true_accu, false_accu = self.model.lstm_forward(sentences, tags)
         self.optimizer.zero_grad()
         loss.backward() 
         total_norm = torch.nn.utils.clip_grad_norm(
@@ -370,8 +403,10 @@ class Trainer(object):
         valid_loss = []
         for batchid in range(len(self.valid_dataset) // args.batch_size):
             sentences, tags, lengths = self.valid_dataset.next_batch()
-            loss, tag_pred = self.model.neg_log_likelihood(sentences, tags)
-            true_accu, false_accu = Trainer.binary_accuracy(tag_pred, tags)
+            if args.use_crf:
+                loss, true_accu, false_accu = self.model.neg_log_likelihood(sentences, tags)
+            else:
+                loss, true_accu, false_accu = self.model.lstm_forward(sentences, tags)
             print(('\tepoch %d, batchid=%d, valid_loss=%.5f,' 
                     ' true_accu=%.5f, false_accu=%.5f') 
                     % (epoch, batchid, loss.data[0], true_accu, false_accu))
@@ -404,10 +439,10 @@ class Trainer(object):
                     self.writer.add_scalar('data/valid_loss', valid_loss, actual_batchid)
                     self.writer.add_scalar('data/v_true_accu', true_accu, actual_batchid)
                     self.writer.add_scalar('data/v_false_accu', false_accu, actual_batchid)
-                    self.writer.add_embedding(self.model.embedding.weight, 
-                            metadata=self.train_dataset.vocab._id2word)
+                    self.writer.add_embedding(self.model.embedding.weight, tag='words',
+                            metadata=self.train_dataset.vocab._id2word, global_step=epoch)
                 # learning rate decay
-                if epoch > 0 and batchid % args.lr_decay_freq == 0:
+                if epoch >= args.lr_start_decay and batchid % args.lr_decay_freq == 0:
                     self.learning_rate = self.learning_rate / 2
                     self.optimizer.param_groups[0]['lr'] = self.learning_rate
                     print('decay lr to %f' % (self.learning_rate))
@@ -424,7 +459,8 @@ class Trainer(object):
                 'true_accu': true_accu,
                 'false_accu': false_accu,
                 'optimizer': self.optimizer,
-                'epoch': epoch
+                'epoch': epoch,
+                'args': args
         }
         print(('saving model, epoch = %d, train_loss = %.5f,'
                 'valid_loss = %.5f') % (epoch, train_loss, valid_loss))
@@ -433,7 +469,7 @@ class Trainer(object):
     def load_checkpoint(self, chpt_name):
         self.checkpoint = torch.load(chpt_name)
         self.model.load_state_dict(self.checkpoint['model'])
-        self.start_epoch = self.checkpoint['epoch']
+        self.start_epoch = self.checkpoint['epoch'] + 1
         self.optimizer = self.checkpoint['optimizer']
         self.learning_rate = self.optimizer.param_groups[0]['lr']
         print("\n%s loaded, learning_rate = %.6f" % (chpt_name, self.learning_rate))
